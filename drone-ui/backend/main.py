@@ -404,9 +404,11 @@ async def health():
 
 @app.post("/api/benchmark")
 async def benchmark_endpoint(
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
+    file: Optional[UploadFile] = File(None),
     models: Optional[str] = Form("all"),
     conf_threshold: float = Form(0.30),
+    conf_thresh: Optional[float] = Form(None),
     pad_image: bool = Form(False),
     pad_scale: float = Form(0.15),
 ):
@@ -419,7 +421,13 @@ async def benchmark_endpoint(
     """
     request_start = time.perf_counter()
     try:
-        data = await image.read()
+        upload = image or file
+        if upload is None:
+            raise HTTPException(status_code=400, detail="Missing image/file upload")
+
+        effective_conf = conf_thresh if conf_thresh is not None else conf_threshold
+
+        data = await upload.read()
         img = decode_image(data)
         if pad_image:
             img = apply_auto_padding(img, scale_factor=pad_scale)
@@ -444,7 +452,7 @@ async def benchmark_endpoint(
                 continue
 
             boxes, scores, labels, detections, metrics = detect_with_model(
-                mname, model_obj, img, conf=conf_threshold
+                mname, model_obj, img, conf=effective_conf
             )
             key = MODEL_KEY_MAP[mname]
             detections_by_model[key] = detections

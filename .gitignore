@@ -1,6 +1,13 @@
 *.pt
 *.pth
 
+# Python env/cache
+.venv/
+venv/
+**/.venv/
+__pycache__/
+*.pyc
+
 models/
 weights/
 checkpoints/

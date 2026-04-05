@@ -266,6 +266,116 @@ MODEL_COLORS = {
     "Cascade":    (0, 200, 255),
 }
 
+MODEL_ORDER = ["YOLOv8s", "RT-DETR-L", "Faster-RCNN", "SSD"]
+MODEL_ALIASES = {
+    "yolo": "YOLOv8s",
+    "yolov8s": "YOLOv8s",
+    "detr": "RT-DETR-L",
+    "rtdetr": "RT-DETR-L",
+    "rt-detr-l": "RT-DETR-L",
+    "frcnn": "Faster-RCNN",
+    "fasterrcnn": "Faster-RCNN",
+    "faster-rcnn": "Faster-RCNN",
+    "ssd": "SSD",
+}
+
+
+def parse_requested_models(models_raw: Optional[str], available_models: dict):
+    requested = (models_raw or "all").strip().lower()
+    if requested == "all":
+        selected = [m for m in MODEL_ORDER if m in available_models]
+        include_ensemble = True
+        return selected, include_ensemble
+
+    include_ensemble = False
+    selected = []
+    for token in [x.strip().lower() for x in requested.split(",") if x.strip()]:
+        if token == "ensemble":
+            include_ensemble = True
+            continue
+        mapped = MODEL_ALIASES.get(token)
+        if mapped and mapped in available_models and mapped not in selected:
+            selected.append(mapped)
+
+    return selected, include_ensemble
+
+
+def detect_with_model(model_name: str, model_obj, img_np: np.ndarray, conf: float):
+    preprocess_start = time.perf_counter()
+    if model_name in ("YOLOv8s", "RT-DETR-L"):
+        boxes, scores, labels, infer_ms = infer_ultralytics(model_obj, img_np, conf=conf)
+    elif model_name == "Faster-RCNN":
+        boxes, scores, labels, infer_ms = infer_torchvision(model_obj, img_np, conf=conf, sz=None)
+    else:
+        boxes, scores, labels, infer_ms = infer_torchvision(model_obj, img_np, conf=conf, sz=320)
+
+    total_ms = (time.perf_counter() - preprocess_start) * 1000.0
+    postprocess_ms = max(0.0, total_ms - infer_ms)
+
+    detections = []
+    for box, score, lbl in zip(boxes, scores, labels):
+        cls_id = int(lbl)
+        cls_name = CLASS_NAMES[cls_id] if 0 <= cls_id < NUM_CLASSES else "Unknown"
+        detections.append({
+            "class": cls_name,
+            "class_id": cls_id,
+            "confidence": float(score),
+            "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
+        })
+
+    metrics = {
+        "preprocess_ms": round(max(0.0, total_ms - infer_ms - postprocess_ms), 2),
+        "inference_ms": round(float(infer_ms), 2),
+        "postprocess_ms": round(float(postprocess_ms), 2),
+        "total_ms": round(float(total_ms), 2),
+        "fps": round(1000.0 / total_ms, 2) if total_ms > 0 else 0.0,
+        "objects_found": len(detections),
+        "avg_confidence": round(float(np.mean(scores)), 3) if len(scores) else 0.0,
+        "max_confidence": round(float(np.max(scores)), 3) if len(scores) else 0.0,
+    }
+
+    return boxes, scores, labels, detections, metrics
+
+
+def build_comparison(per_model_benchmark: dict, detections_by_model: dict):
+    if not per_model_benchmark:
+        return {
+            "fastest": None,
+            "most_accurate": None,
+            "best_overall": None,
+            "most_detections": None,
+        }
+
+    valid_models = list(per_model_benchmark.keys())
+    fastest = min(valid_models, key=lambda m: per_model_benchmark[m].get("total_ms", float("inf")))
+    most_accurate = max(valid_models, key=lambda m: per_model_benchmark[m].get("avg_confidence", 0.0))
+    most_detections = max(valid_models, key=lambda m: len(detections_by_model.get(m, [])))
+
+    # simple blended score for dashboard summary
+    def score(m):
+        b = per_model_benchmark[m]
+        speed = 1.0 / max(b.get("total_ms", 1.0), 1.0)
+        conf = b.get("avg_confidence", 0.0)
+        count = b.get("objects_found", 0)
+        return (0.45 * speed) + (0.4 * conf) + (0.15 * min(count / 10.0, 1.0))
+
+    best_overall = max(valid_models, key=score)
+    return {
+        "fastest": fastest,
+        "most_accurate": most_accurate,
+        "best_overall": best_overall,
+        "most_detections": most_detections,
+    }
+
+
+MODEL_KEY_MAP = {
+    "YOLOv8s": "yolo",
+    "RT-DETR-L": "detr",
+    "Faster-RCNN": "frcnn",
+    "SSD": "ssd",
+}
+
+
 # ── FastAPI ───────────────────────────────────────────────────────────────────
 app = FastAPI(title="Drone Detection API", version="1.0")
 
@@ -293,77 +403,104 @@ async def health():
     }
 
 @app.post("/api/benchmark")
-async def benchmark_endpoint(file: UploadFile = File(...), pad_image: bool = Form(False), pad_scale: float = Form(0.15), conf_thresh: float = Form(0.30)):
+async def benchmark_endpoint(
+    image: UploadFile = File(...),
+    models: Optional[str] = Form("all"),
+    conf_threshold: float = Form(0.30),
+    pad_image: bool = Form(False),
+    pad_scale: float = Form(0.15),
+):
     """
-    Run the uploaded image through all 4 models individually.
-    Returns per-model metrics + annotated images.
+    Contract-aligned endpoint:
+      POST /api/benchmark
+      - image: uploaded file
+      - models: comma-separated (e.g. "yolo,ensemble") or "all"
+      - conf_threshold: float (default 0.30)
     """
+    request_start = time.perf_counter()
     try:
-        data = await file.read()
+        data = await image.read()
         img = decode_image(data)
         if pad_image:
             img = apply_auto_padding(img, scale_factor=pad_scale)
-        models = get_models()
 
-        results = []
-        MODEL_ORDER = ["YOLOv8s", "RT-DETR-L", "Faster-RCNN", "SSD"]
+        h, w = img.shape[:2]
+        loaded_models = get_models()
+        selected_models, include_ensemble = parse_requested_models(models, loaded_models)
 
-        for mname in MODEL_ORDER:
-            model = models.get(mname)
-            if model is None:
-                results.append({
-                    "model": mname,
-                    "error": "Model not loaded",
-                    "detections": [],
-                    "metrics": {},
-                    "annotated_image": None,
-                })
+        if not selected_models and not include_ensemble:
+            raise HTTPException(
+                status_code=400,
+                detail="No valid models requested. Use models=all or comma-separated: yolo,detr,frcnn,ssd,ensemble",
+            )
+
+        detections_by_model = {}
+        benchmark_by_model = {}
+        all_boxes, all_scores, all_labels = [], [], []
+
+        for mname in selected_models:
+            model_obj = loaded_models.get(mname)
+            if model_obj is None:
                 continue
 
-            try:
-                if mname in ("YOLOv8s", "RT-DETR-L"):
-                    boxes, scores, labels, ms = infer_ultralytics(model, img, conf=conf_thresh)
-                elif mname == "Faster-RCNN":
-                    boxes, scores, labels, ms = infer_torchvision(model, img, conf=conf_thresh, sz=None)
-                else:  # SSD
-                    boxes, scores, labels, ms = infer_torchvision(model, img, conf=conf_thresh, sz=320)
+            boxes, scores, labels, detections, metrics = detect_with_model(
+                mname, model_obj, img, conf=conf_threshold
+            )
+            key = MODEL_KEY_MAP[mname]
+            detections_by_model[key] = detections
+            benchmark_by_model[key] = metrics
+            all_boxes.append(boxes)
+            all_scores.append(scores)
+            all_labels.append(labels)
 
-                # Per-class count
-                class_counts = {name: 0 for name in CLASS_NAMES}
-                for lbl in labels:
-                    idx = int(lbl)
-                    if 0 <= idx < NUM_CLASSES:
-                        class_counts[CLASS_NAMES[idx]] += 1
+        if include_ensemble and all_boxes:
+            t0 = time.perf_counter()
+            fused_b, fused_s, fused_l = wbf(all_boxes, all_scores, all_labels)
+            fusion_ms = (time.perf_counter() - t0) * 1000.0
 
-                metrics = {
-                    "latency_ms": round(float(ms), 2),
-                    "fps": round(1000.0 / ms, 2) if ms > 0 else 0.0,
-                    "avg_confidence": round(float(np.mean(scores)), 4) if len(scores) else 0.0,
-                    "total_detections": int(len(scores)),
-                    "class_counts": class_counts,
-                }
-
-                color = MODEL_COLORS.get(mname, (255, 255, 0))
-                vis = draw_boxes_on_img(img, boxes, scores, labels, color=color)
-                img_b64 = encode_image_b64(vis)
-
-                results.append({
-                    "model": mname,
-                    "detections": boxes_to_list(boxes, scores, labels),
-                    "metrics": metrics,
-                    "annotated_image": img_b64,
-                })
-            except Exception as e:
-                results.append({
-                    "model": mname,
-                    "error": str(e),
-                    "detections": [],
-                    "metrics": {},
-                    "annotated_image": None,
+            ensemble_detections = []
+            for box, score, lbl in zip(fused_b, fused_s, fused_l):
+                cls_id = int(lbl)
+                cls_name = CLASS_NAMES[cls_id] if 0 <= cls_id < NUM_CLASSES else "Unknown"
+                ensemble_detections.append({
+                    "class": cls_name,
+                    "class_id": cls_id,
+                    "confidence": float(score),
+                    "bbox": [float(box[0]), float(box[1]), float(box[2]), float(box[3])],
                 })
 
-        return JSONResponse({"results": results, "device": DEVICE_NAME})
+            detections_by_model["ensemble"] = ensemble_detections
+            benchmark_by_model["ensemble"] = {
+                "fusion_ms": round(float(fusion_ms), 2),
+                "total_ms": round(float(fusion_ms), 2),
+                "objects_found": len(ensemble_detections),
+                "avg_confidence": round(float(np.mean(fused_s)), 3) if len(fused_s) else 0.0,
+                "max_confidence": round(float(np.max(fused_s)), 3) if len(fused_s) else 0.0,
+            }
 
+        total_request_ms = (time.perf_counter() - request_start) * 1000.0
+
+        response = {
+            "image": {
+                "width": int(w),
+                "height": int(h),
+                "annotated_base64": f"data:image/jpeg;base64,{encode_image_b64(img)}",
+            },
+            "detections": detections_by_model,
+            "benchmark": {
+                "per_model": benchmark_by_model,
+                "ensemble": benchmark_by_model.get("ensemble"),
+                "total_request_ms": round(float(total_request_ms), 2),
+            },
+            "comparison": build_comparison(
+                {k: v for k, v in benchmark_by_model.items() if k != "ensemble"},
+                detections_by_model,
+            ),
+        }
+        return JSONResponse(response)
+
+    except HTTPException:
+        raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
